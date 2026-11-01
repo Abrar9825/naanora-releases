@@ -58,10 +58,17 @@ jobs:
         working-directory: source
         shell: pwsh
         run: |
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name,Free,Used | Format-Table
           dotnet publish windows/msix/Launcher/Launcher.csproj -c Release -o .local-run/update-test-next -p:Version=1.0.9.1 -p:NoWarn=MSB3277 --no-restore
           if ($LASTEXITCODE -ne 0) { throw 'Next-version update test build failed' }
           dotnet run --project windows/update-tests --configuration Release -- (Join-Path $pwd '.local-run/update-tests') (Join-Path $pwd 'windows/msix/out/local-app') (Join-Path $pwd 'windows/msix/out/local-payload.zip') (Join-Path $pwd '.local-run/update-test-next')
           if ($LASTEXITCODE -ne 0) { throw 'Update safety checks failed' }
+          # Dispose isolated test databases and duplicate runtime trees before
+          # checking fresh-install free-space requirements on hosted runners.
+          $testRoot = [IO.Path]::GetFullPath((Join-Path $pwd '.local-run/update-tests'))
+          $allowed = [IO.Path]::GetFullPath((Join-Path $pwd '.local-run')) + [IO.Path]::DirectorySeparatorChar
+          if (-not $testRoot.StartsWith($allowed, [StringComparison]::OrdinalIgnoreCase)) { throw 'Unsafe test cleanup path' }
+          Remove-Item -LiteralPath $testRoot -Recurse -Force
           $setup = Join-Path $pwd 'windows/msix/out/setup-bootstrap/Naanora-Setup.exe'
           $exe = Join-Path $pwd "windows/msix/out/delivery/Naanora-Setup-$env:RELEASE_VERSION-win-x64.exe"
           $verify = Start-Process $setup -ArgumentList @('--verify-payload', $exe) -Wait -PassThru -WindowStyle Hidden
@@ -69,7 +76,11 @@ jobs:
           $probe = Join-Path $pwd 'windows/msix/out/local-app/Naanora.exe'
           $workspace = Join-Path $pwd '.local-run/release-provision'
           $verify = Start-Process $probe -ArgumentList @('--verify-local-setup', $workspace) -Wait -PassThru -WindowStyle Hidden
-          if ($verify.ExitCode -ne 0) { throw 'Real database initialization, migrations or health checks failed' }
+          if ($verify.ExitCode -ne 0) {
+            Get-Content (Join-Path $workspace 'setup-result.json') -ErrorAction SilentlyContinue
+            Get-ChildItem (Join-Path $workspace 'data/logs') -Filter '*.log' -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_.Name; Get-Content $_.FullName -Tail 25 }
+            throw 'Real database initialization, migrations or health checks failed'
+          }
       - name: Sign update information
         working-directory: source
         shell: pwsh
