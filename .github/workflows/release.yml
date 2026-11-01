@@ -1,0 +1,94 @@
+name: Build and release Naanora
+
+on:
+  push:
+    branches: [main]
+    paths: [release-request.json, .github/workflows/release.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: naanora-stable
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Read release request
+        shell: pwsh
+        run: |
+          $request = Get-Content release-request.json -Raw | ConvertFrom-Json
+          if ($request.SourceSha -notmatch '^[a-f0-9]{40}$' -or $request.Version -notmatch '^\d+\.\d+\.\d+\.\d+$') { throw 'Invalid release request' }
+          "SOURCE_SHA=$($request.SourceSha)" >> $env:GITHUB_ENV
+          "RELEASE_VERSION=$($request.Version)" >> $env:GITHUB_ENV
+      - name: Fetch exact private source with a read-only deploy key
+        uses: actions/checkout@v4
+        with:
+          repository: Abrar9825/naanora-POS
+          ref: ${{ env.SOURCE_SHA }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: source
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: source/.node-version
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - name: Install pinned package manager and dependencies
+        working-directory: source
+        shell: pwsh
+        run: |
+          npm install --global pnpm@11.10.0
+          if ($LASTEXITCODE -ne 0) { throw 'pnpm installation failed' }
+          pnpm install --frozen-lockfile
+          if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed' }
+      - name: Build native installer with complete server assets
+        working-directory: source
+        shell: pwsh
+        run: ./windows/installer/build-local-installer.ps1 -ReleaseVersion $env:RELEASE_VERSION
+      - name: Run updater and database safety checks
+        working-directory: source
+        shell: pwsh
+        run: |
+          dotnet run --project windows/update-tests --configuration Release -- (Join-Path $pwd '.local-run/update-tests')
+          if ($LASTEXITCODE -ne 0) { throw 'Update safety checks failed' }
+          $setup = Join-Path $pwd 'windows/msix/out/setup-bootstrap/Naanora-Setup.exe'
+          $exe = Join-Path $pwd "windows/msix/out/delivery/Naanora-Setup-$env:RELEASE_VERSION-win-x64.exe"
+          $verify = Start-Process $setup -ArgumentList @('--verify-payload', $exe) -Wait -PassThru -WindowStyle Hidden
+          if ($verify.ExitCode -ne 0) { throw 'Installer payload verification failed' }
+          $probe = Join-Path $pwd 'windows/msix/out/local-app/Naanora.exe'
+          $workspace = Join-Path $pwd '.local-run/release-provision'
+          $verify = Start-Process $probe -ArgumentList @('--verify-local-setup', $workspace) -Wait -PassThru -WindowStyle Hidden
+          if ($verify.ExitCode -ne 0) { throw 'Real database initialization, migrations or health checks failed' }
+      - name: Sign update information
+        working-directory: source
+        shell: pwsh
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: |
+          $pg = & ./windows/msix/out/local-app/server/postgres/bin/pg_ctl.exe --version
+          if ($pg -notmatch '(\d+)\.') { throw 'Cannot determine PostgreSQL major' }
+          node scripts/create-update.cjs windows/msix/out/local-payload.zip $env:RELEASE_VERSION $Matches[1] windows/msix/out/delivery
+          if ($LASTEXITCODE -ne 0) { throw 'Update signing failed' }
+      - name: Publish verified release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "v$env:RELEASE_VERSION"
+          $files = @("source/windows/msix/out/delivery/Naanora-Setup-$env:RELEASE_VERSION-win-x64.exe", "source/windows/msix/out/delivery/Naanora-Setup-$env:RELEASE_VERSION-win-x64.exe.sha256", "source/windows/msix/out/delivery/Naanora-Update-$env:RELEASE_VERSION-win-x64.zip", 'source/windows/msix/out/delivery/update.json', 'source/windows/msix/out/delivery/CLIENT-GUIDE-HINGLISH.txt')
+          # A rerun never mutates an already published release.
+          gh release view $tag --repo Abrar9825/naanora-releases *> $null
+          if ($LASTEXITCODE -eq 0) { Write-Host 'Release already exists; leaving it unchanged'; exit 0 }
+          gh release create $tag @files --repo Abrar9825/naanora-releases --draft --title "Naanora $env:RELEASE_VERSION" --notes "Automatic Windows release. Download the Setup EXE for a new installation. Installed apps download the signed update in the background; choose Update & Restart after all counters finish billing. Restaurant data is preserved. Source commit: $env:SOURCE_SHA. Matching AGPL source is supplied to recipients on request."
+          if ($LASTEXITCODE -ne 0) { throw 'Release upload failed; no client update was published' }
+          gh release edit $tag --repo Abrar9825/naanora-releases --draft=false --latest
+          if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
