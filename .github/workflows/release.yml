@@ -99,9 +99,16 @@ jobs:
           $tag = "v$env:RELEASE_VERSION"
           $files = @("source/windows/msix/out/delivery/Naanora-Setup-$env:RELEASE_VERSION-win-x64.exe", "source/windows/msix/out/delivery/Naanora-Setup-$env:RELEASE_VERSION-win-x64.exe.sha256", "source/windows/msix/out/delivery/Naanora-Update-$env:RELEASE_VERSION-win-x64.zip", 'source/windows/msix/out/delivery/update.json', 'source/windows/msix/out/delivery/CLIENT-GUIDE-HINGLISH.txt')
           # A rerun never mutates an already published release.
-          gh release view $tag --repo Abrar9825/naanora-releases *> $null
-          if ($LASTEXITCODE -eq 0) { Write-Host 'Release already exists; leaving it unchanged'; exit 0 }
-          gh release create $tag @files --repo Abrar9825/naanora-releases --draft --title "Naanora $env:RELEASE_VERSION" --notes "Automatic Windows release. Download the Setup EXE for a new installation. Installed apps download the signed update in the background; choose Update & Restart after all counters finish billing. Restaurant data is preserved. Source commit: $env:SOURCE_SHA. Matching AGPL source is supplied to recipients on request."
+          $draft = gh release view $tag --repo Abrar9825/naanora-releases --json isDraft --jq .isDraft 2>$null
+          $exists = $LASTEXITCODE -eq 0
+          if ($exists -and $draft -eq 'false') { Write-Host 'Release already published; leaving it unchanged'; exit 0 }
+          if ($exists) {
+            # An interrupted upload may leave an unpublished draft. It is safe
+            # to finish that draft, but never replace published release assets.
+            gh release upload $tag @files --repo Abrar9825/naanora-releases --clobber
+          } else {
+            gh release create $tag @files --repo Abrar9825/naanora-releases --draft --title "Naanora $env:RELEASE_VERSION" --notes "Automatic Windows release. Download the Setup EXE for a new installation. Installed apps download the signed update in the background; choose Update & Restart after all counters finish billing. Restaurant data is preserved. Source commit: $env:SOURCE_SHA. Matching AGPL source is supplied to recipients on request."
+          }
           if ($LASTEXITCODE -ne 0) { throw 'Release upload failed; no client update was published' }
           gh release edit $tag --repo Abrar9825/naanora-releases --draft=false --latest
           if ($LASTEXITCODE -ne 0) { throw 'Release publication failed' }
